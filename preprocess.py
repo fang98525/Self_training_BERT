@@ -7,7 +7,7 @@ import pandas as pd
 import re
 from tqdm import tqdm
 from config import Config
-
+# 处理后得到干净的text预料
 
 def stop_words(x):
     try:

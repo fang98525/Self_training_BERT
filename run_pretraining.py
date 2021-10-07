@@ -15,25 +15,26 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
 from random import shuffle, choice, sample
 from pytorch_pretrained_bert.file_utils import WEIGHTS_NAME
-from pytorch_pretrained_bert.modeling import BertForMaskedLM, BertConfig
+from pytorch_pretrained_bert.modeling import BertForMaskedLM, BertConfig  # 对bert进行修改
 from pytorch_pretrained_bert.tokenization import BertTokenizer
 from pytorch_pretrained_bert.optimization import BertAdam
 
 args = Config()
 rng = random.Random(args.seed)
 random.seed(args.seed)
-gpu_id = 2
+gpu_id = 0
 print('GPU ID', gpu_id)
 os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 logger = logging.getLogger(__name__)
 
 
 def warmup_linear(x, warmup=0.002):
+    """x为传入的比例，慢热学习比例   默认0.002的样本个数采用慢热lr 一般比较大  然后变小收敛"""
     if x < warmup:
         return x / warmup
     return 1.0 - x
 
-
+#bert Pipline 里面的写法
 class InputFeatures(object):
     """A single set of features of data."""
 
@@ -43,7 +44,7 @@ class InputFeatures(object):
         self.segment_ids = segment_ids
         self.label_id = label_id
 
-
+#搬运bert的代码  掩盖率15   最大掩盖数20
 def create_masked_lm_predictions(tokens, masked_lm_prob, max_predictions_per_seq, vocab_list):
     """Creates the predictions for the masked LM objective.
     This is mostly copied from the Google BERT repo, but
@@ -90,10 +91,10 @@ def create_examples(data_path, max_seq_length, masked_lm_prob, max_predictions_p
         # tokens_a = line.strip("\n").split()[:max_num_tokens]##适合英文和序列
         line = line.strip()
         line = line.replace('\u2028','')
-        tokens_a = tokenizer.tokenize(line.strip())[:max_num_tokens]
+        tokens_a = tokenizer.tokenize(line.strip())[:max_num_tokens]   #超长则截断
         tokens = ["[CLS]"] + tokens_a + ["[SEP]"]
         segment_ids = [0 for _ in range(len(tokens_a) + 2)]
-        # remove too short sample
+        # remove too short sample   短文本不进行MLM任务
         if len(tokens_a) <= 10:
             continue
         tokens, masked_lm_positions, masked_lm_labels = create_masked_lm_predictions(
@@ -104,7 +105,7 @@ def create_examples(data_path, max_seq_length, masked_lm_prob, max_predictions_p
             "masked_lm_positions": masked_lm_positions,
             "masked_lm_labels": masked_lm_labels}
         examples.append(example)
-        if k == 5000:
+        if k == 5000:  #只创建5000个样本
             break
         k += 1
     fr.close()
@@ -144,7 +145,7 @@ def convert_examples_to_features(examples, max_seq_length, tokenizer):
 
 
 def main():
-    if args.local_rank == -1 or args.no_cuda:
+    if args.local_rank == -1 or args.no_cuda:  #不采用分布式训练
         device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
         n_gpu = torch.cuda.device_count()
     else:
@@ -152,7 +153,7 @@ def main():
         device = torch.device("cuda", args.local_rank)
         n_gpu = 1
         # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
-        torch.distributed.init_process_group(backend='nccl')
+        torch.distributed.init_process_group(backend='nccl')  #采用分布式训练
 
     logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                         datefmt='%m/%d/%Y %H:%M:%S',
@@ -165,18 +166,18 @@ def main():
         raise ValueError("Invalid gradient_accumulation_steps parameter: {}, should be >= 1".format(
             args.gradient_accumulation_steps))
 
-    args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
-
+    args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps   #如果采用梯度累计
+    #以种子为初始条件   不停的产生随机数
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
-
+     #有无文件  若没有则生成一个
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train:
         raise ValueError("Output directory ({}) already exists and is not empty.".format(args.output_dir))
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
-
+    #采用bert 的分词器   nazhe 是基于中文的预料训练的
     tokenizer = BertTokenizer(vocab_file=args.vocab_file)
 
     train_examples = None
@@ -188,7 +189,7 @@ def main():
 
     if args.do_train:
         train_examples = []
-        for _ in range(args.dupe_factor):  # 动态掩盖
+        for _ in range(args.dupe_factor):  # 整体样本的动态掩盖次数  默认为1
             print("create_training_instances.started...")
             instances = create_examples(data_path=args.pretrain_train_path,
                                         max_seq_length=args.max_seq_length,
@@ -196,8 +197,10 @@ def main():
                                         max_predictions_per_seq=args.max_predictions_per_seq,
                                         vocab_list=vocab_list, tokenizer=tokenizer)
             train_examples += instances
+            print("MLM样本:",train_examples[:3])  #5000
+            print("MLM样本的size:", len(train_examples))
             print("create_training_instances.ended...")
-
+        #需要优化的步数   samples / batchsize
         num_train_optimization_steps = int(
             len(train_examples) / args.train_batch_size / args.gradient_accumulation_steps) * args.num_train_epochs
         if args.local_rank != -1:
@@ -231,7 +234,8 @@ def main():
     """冻结word_embedding参数,大字典时可能需要"""
     if args.frozen:
         for para in model.bert.embeddings.word_embeddings.parameters():
-            para.requires_grad = False
+            para.requires_grad = False   #冻结bert 的所有参数
+            #将梯度 为true 需要更新的 放进参数列表
         param_optimizer = list(filter(lambda p: p[1].requires_grad, model.named_parameters()))
         # model.bert.embeddings.word_embeddings.cpu() #embdedding进cpu
     # Prepare optimizer
@@ -239,6 +243,7 @@ def main():
         param_optimizer = list(model.named_parameters())
 
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+    #对优化的参数进行分组   'bias', 'LayerNorm.bias', 'LayerNorm.weight'不添加正则   不在里面的添加正则，正则程度为0.01
     optimizer_grouped_parameters = [
         {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
         {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
@@ -272,6 +277,7 @@ def main():
     best_loss = 100000
 
     if args.do_train:
+        #将数字化特征转化为张量
         train_features = convert_examples_to_features(
             train_examples, args.max_seq_length, tokenizer)
         all_input_ids = torch.tensor([f.input_ids for f in train_features], dtype=torch.long)
@@ -284,6 +290,7 @@ def main():
             train_sampler = RandomSampler(train_data)
         else:
             train_sampler = DistributedSampler(train_data)
+        #加载到dataloader
         train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size)
 
         model.train()
